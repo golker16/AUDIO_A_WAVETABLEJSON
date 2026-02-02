@@ -86,3 +86,4 @@ jobs:
           path: |
             dist/wtgen_json*
             dist/wtgen_json.exe
+
