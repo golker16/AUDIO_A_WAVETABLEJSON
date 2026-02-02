@@ -1,0 +1,61 @@
+name: Build Windows EXE (WTGen)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          if (Test-Path "requirements.txt") {
+            pip install -r requirements.txt
+          }
+          pip install pyinstaller
+
+      - name: Build EXE (PyInstaller onedir)
+        shell: pwsh
+        run: |
+          $iconArg = ""
+          if (Test-Path "assets/icon.ico") { $iconArg = "--icon assets/icon.ico" }
+
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onedir `
+            --name "WTGen" `
+            $iconArg `
+            app.py
+
+          # Resultado: dist/WTGen/WTGen.exe
+
+      - name: Smoke test (run --help)
+        shell: pwsh
+        run: |
+          .\dist\WTGen\WTGen.exe --help
+
+      - name: Package artifact (zip)
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/WTGen/*" -DestinationPath "WTGen-windows.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WTGen-windows
+          path: WTGen-windows.zip
