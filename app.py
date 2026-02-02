@@ -48,7 +48,7 @@ def export_wav_to_json(in_wav: Path, out_dir: Path, d: ExportDefaults) -> Path:
         raise FileNotFoundError(f"Input no existe: {in_wav}")
 
     # Nombre: mismo base name, pero .json (no .wtgen.json)
-    out_path = out_dir / f"{in_wav.stem}.json"
+    out_path = out_dir / f"{in_wav.stem}.wtgen.json"
 
     frames, meta = wav_to_frames_and_meta(
         wav_path=in_wav,
