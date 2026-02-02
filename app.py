@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import math
+import struct
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +44,21 @@ PERSIST_NEIGHBOR = 2     # requiere RMS alto también en vecinos (suaviza picks 
 # YIN
 YIN_THRESHOLD = 0.15     # umbral típico: 0.10-0.20
 YIN_MIN_PERIOD_MS = 0.5  # evita periodos absurdos (muy alta freq)
+
+# ----------------------------
+# WTGEN-1.2 "spectralData" (Ruta 1)
+# ----------------------------
+DEFAULT_HARMONICS = 512   # magnitudes armónicas por frame (1..H)
+DEFAULT_NOISE_BANDS = 48  # bandas para residual/ruido (coarse)
+PHASE_MODE = "minimumPhase"  # declarativo: el plugin reconstruye fase
+
+# cuantización normada
+HARM_QUANT = "u16_q12"        # amp_q = round(amp * 4096)  (amp lineal)
+NOISE_DB_QUANT = "i16_q0.5db" # db_q = round(db * 2)       (0.5 dB)
+
+# límite de dB para residual
+NOISE_DB_MIN = -64.0
+NOISE_DB_MAX = +16.0
 
 
 @dataclass
@@ -376,24 +392,136 @@ def frame_smooth(frames: np.ndarray, amount: float) -> np.ndarray:
     return out
 
 
-def pack_q15_framepack(frames: np.ndarray) -> str:
+# ----------------------------
+# spectralData: harmonic + noise bands + (optional transient placeholders)
+# ----------------------------
+def _linear_band_edges(lo_bin: int, hi_bin: int, bands: int) -> list[tuple[int, int]]:
     """
-    frames: shape (F, N) float32 in [-1,1]
-    q15: int16 little-endian, base64
+    Divide [lo_bin..hi_bin] en 'bands' bandas lineales (inclusive),
+    devolviendo lista de (start,end) inclusive. Determinista.
     """
-    x = np.clip(frames, -1.0, 1.0)
-    q = np.round(x * 32767.0).astype(np.int16)  # Q15
-    raw = q.tobytes(order="C")
-    return base64.b64encode(raw).decode("ascii")
+    if bands <= 0 or hi_bin < lo_bin:
+        return []
+    length = hi_bin - lo_bin + 1
+    edges = []
+    for b in range(bands):
+        a = lo_bin + (b * length) // bands
+        c = lo_bin + ((b + 1) * length) // bands - 1
+        c = max(a, c)
+        edges.append((a, c))
+    return edges
+
+
+def frames_to_harm_noise(frames: np.ndarray, harm_count: int, noise_bands: int) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Convierte frames time-domain (F,N) a:
+      harm_q: (F,H) uint16 (u16_q12)
+      noise_q: (F,B) int16 (0.5 dB steps)
+    y devuelve info auxiliar para el JSON.
+    """
+    F, N = frames.shape
+    max_harm = max(1, (N // 2) - 1)
+    H = int(min(harm_count, max_harm))
+
+    # bins: rfft -> indices 0..N/2
+    # armónicos del ciclo: bin k corresponde a armónico k (porque 1 ciclo en N samples)
+    # escala amplitud: amp ≈ (2/N)*|X[k]|  para k>0 (aprox)
+    amp_scale = 2.0 / float(N)
+
+    # residual bins (después de H)
+    lo_bin = H + 1
+    hi_bin = N // 2
+    band_edges = _linear_band_edges(lo_bin, hi_bin, int(noise_bands))
+
+    harm_q = np.zeros((F, H), dtype=np.uint16)
+    noise_q = np.zeros((F, len(band_edges)), dtype=np.int16)
+
+    eps = 1e-12
+
+    for i in range(F):
+        x = frames[i].astype(np.float64, copy=False)
+        X = np.fft.rfft(x)
+        mag = np.abs(X)
+
+        # amplitudes armónicas (bins 1..H)
+        harm_amp = mag[1:H + 1] * amp_scale  # lineal
+        harm_amp = np.clip(harm_amp, 0.0, 4.0)  # margen de seguridad
+
+        # cuantización u16_q12: q = round(amp * 4096)
+        qh = np.round(harm_amp * 4096.0).astype(np.int64)
+        qh = np.clip(qh, 0, 65535).astype(np.uint16)
+        harm_q[i, :] = qh
+
+        # ruido/residual por bandas (bins H+1..N/2)
+        for b, (a, c) in enumerate(band_edges):
+            seg = mag[a:c + 1] * amp_scale
+            # medida robusta: RMS de amplitud en la banda
+            rms = float(np.sqrt(np.mean(seg * seg))) if seg.size else 0.0
+            db = 20.0 * math.log10(max(rms, eps))
+            db = float(np.clip(db, NOISE_DB_MIN, NOISE_DB_MAX))
+            qdb = int(np.round(db * 2.0))  # 0.5 dB steps
+            qdb = int(np.clip(qdb, -32768, 32767))
+            noise_q[i, b] = np.int16(qdb)
+
+    info = {
+        "harmonicsCount": H,
+        "noiseBands": int(len(band_edges)),
+        "ampScale": "rfft_mag*(2/N)",
+        "harmQuant": HARM_QUANT,
+        "noiseDbQuant": NOISE_DB_QUANT,
+        "noiseDbRange": [NOISE_DB_MIN, NOISE_DB_MAX],
+        "banding": {
+            "type": "linear_bins",
+            "loBin": int(lo_bin),
+            "hiBin": int(hi_bin),
+        },
+    }
+    return harm_q, noise_q, info
+
+
+def pack_harm_noise_framepack(harm_q: np.ndarray, noise_q: np.ndarray,
+                             table_size: int) -> str:
+    """
+    Codec: harm-noise-framepack-v1  (determinista, little-endian)
+    Layout (bytes):
+      magic 8 bytes: b'HNFPv1\\0'
+      u16 tableSize
+      u16 frames
+      u16 harmCount
+      u16 noiseBands
+      then frames:
+        harmCount * u16  (u16_q12)
+        noiseBands * i16 (0.5 dB steps)
+        transient placeholders (3 * u16 q15): amount, center, width  (por ahora 0)
+    """
+    F, H = harm_q.shape
+    B = noise_q.shape[1]
+
+    out = bytearray()
+    out += b"HNFPv1\0"  # 7 bytes + null = 8
+    out += struct.pack("<HHHH", int(table_size), int(F), int(H), int(B))
+
+    # placeholders transientes (q15)
+    t_amount = 0
+    t_center = 0
+    t_width = 0
+
+    # frame data
+    for i in range(F):
+        out += harm_q[i].astype("<u2", copy=False).tobytes(order="C")
+        out += noise_q[i].astype("<i2", copy=False).tobytes(order="C")
+        out += struct.pack("<HHH", t_amount, t_center, t_width)
+
+    return base64.b64encode(bytes(out)).decode("ascii")
 
 
 # ----------------------------
-# Main pipeline: WAV -> WT frames
+# Main pipeline: WAV -> frames -> spectralData payload
 # ----------------------------
-def wav_to_wavetable_frames(wav_path: Path,
-                            sr_target: int,
-                            frames_n: int,
-                            table_size: int) -> tuple[np.ndarray, ImportMeta]:
+def wav_to_frames_and_meta(wav_path: Path,
+                           sr_target: int,
+                           frames_n: int,
+                           table_size: int) -> tuple[np.ndarray, ImportMeta]:
     # load
     audio, sr0 = sf.read(str(wav_path), always_2d=True, dtype="float32")
     src_channels = audio.shape[1]
@@ -476,11 +604,11 @@ def wav_to_wavetable_frames(wav_path: Path,
     # optional smoothing across frames
     out_frames = frame_smooth(out_frames, FRAME_SMOOTH)
 
-    # DC remove per frame
+    # DC remove per frame (aquí es pre, no post; ayuda a estabilizar el espectro)
     for k in range(frames_n):
         out_frames[k] = dc_remove_frame(out_frames[k], strength=1.0)
 
-    # normalize global
+    # normalize global (igual: estabiliza escala espectral)
     out_frames = normalize_global(out_frames, target=0.999)
 
     picked_time_s = float(peak_idx / sr) if sr > 0 else 0.0
@@ -503,22 +631,52 @@ def wav_to_wavetable_frames(wav_path: Path,
     return out_frames, meta
 
 
-def build_wtgen_json(frames: np.ndarray,
-                     meta: ImportMeta,
-                     engine_name: str,
-                     engine_version: str,
-                     preset_name: str,
-                     seed: int,
-                     table_size: int,
-                     frames_n: int) -> dict:
-    b64 = pack_q15_framepack(frames)
+# ----------------------------
+# WTGEN JSON builder (Ruta 1: spectralData + macros/perFramePack scaffolding)
+# ----------------------------
+def build_wtgen_json_spectral(frames: np.ndarray,
+                              meta: ImportMeta,
+                              engine_name: str,
+                              engine_version: str,
+                              preset_name: str,
+                              seed: int,
+                              table_size: int,
+                              frames_n: int,
+                              harm_count: int,
+                              noise_bands: int) -> dict:
+    # 1) time frames -> harmonic/noise quant data
+    harm_q, noise_q, spec_info = frames_to_harm_noise(frames, harm_count=harm_count, noise_bands=noise_bands)
+    b64 = pack_harm_noise_framepack(harm_q, noise_q, table_size=table_size)
+
+    # 2) WTGEN-1.2 closures (normative)
+    determinism = {
+        "hash32": "xxhash32",     # normativo (plugin)
+        "prng": "pcg32",          # normativo (plugin)
+        "floatDeterminism": "quantized_payload",  # el payload cuantizado es lo que asegura reproducibilidad
+        "macroParam": {"requireKind": True},
+        "paramPath": "json_pointer",
+        "postPolicy": {
+            "postAlwaysLast": True,
+            "opsDisallowed": ["normalize", "dcRemove"]  # en WTGEN-1: solo en post
+        }
+    }
+
+    # 3) program.macros (siempre presente con defaults)
+    macros = {"complexity": 0.5, "brightness": 0.5, "motion": 0.0}
 
     doc = {
         "schema": "wtgen-1",
-        "engine": {"name": engine_name, "version": engine_version},
+        "engine": {
+            "name": engine_name,
+            "version": engine_version,
+            "determinism": determinism,
+            # opcional: versiones de ops si luego las agregas
+            "opVersions": {}
+        },
         "wt": {"tableSize": int(table_size), "frames": int(frames_n), "channels": 1},
         "seed": int(seed),
 
+        # trazabilidad: se puede borrar en “release”, pero es útil para debug
         "import": {
             "source": {
                 "type": "wav",
@@ -548,57 +706,86 @@ def build_wtgen_json(frames: np.ndarray,
                 "f0Hz": meta.f0_hz,
                 "periodSamples": meta.period_samples,
                 "cmndMin": meta.cmnd_min
-            },
-            "build": {
-                "cyclePolicy": "consecutive_centered",
-                "resample": "cubic",
-                "frameSmooth": FRAME_SMOOTH,
-                "anchorSample": meta.anchor_sample
             }
         },
 
         "program": {
             "mode": "graph",
+            "macros": macros,
             "nodes": [
                 {
                     "id": "src",
-                    "op": "tableData",
+                    "op": "spectralData",
                     "p": {
-                        "codec": "q15-framepack-v1",
+                        "codec": "harm-noise-framepack-v1",
                         "tableSize": int(table_size),
                         "frames": int(frames_n),
                         "channels": 1,
+
+                        "harmonics": {
+                            "count": int(spec_info["harmonicsCount"]),
+                            "quant": spec_info["harmQuant"],
+                            "ampScale": spec_info["ampScale"]
+                        },
+                        "noise": {
+                            "bands": int(spec_info["noiseBands"]),
+                            "quantDb": spec_info["noiseDbQuant"],
+                            "dbRange": spec_info["noiseDbRange"],
+                            "banding": spec_info["banding"]
+                        },
+                        "phase": {"mode": PHASE_MODE},
+
+                        # payload cuantizado (determinista)
                         "data": b64
-                    }
+                    },
+
+                    # scaffolding pro (vacío por ahora; el plugin lo soporta)
+                    # perFrame: mapa paramPath(JSON Pointer) -> ModStack
+                    "perFrame": {},
+                    # perFramePack separado (reservado)
+                    "perFramePack": None
                 }
             ],
             "out": "src"
         },
 
+        # morph declarativo (plugin)
         "morph": {"frameInterp": "cubic", "phasePolicy": "unwrap_lock"},
 
+        # post SIEMPRE al final (normativo). normalize/dcRemove NO como ops.
         "post": {
             "dcRemove": True,
             "normalize": {"mode": "peak", "target": 0.999, "scope": "global"},
             "loopPolish": {"mode": "minclick", "strength": 0.5}
         },
 
-        "meta": {"name": preset_name, "tags": ["wav", "fidelity", "peakmatch"]}
+        "meta": {"name": preset_name, "tags": ["spectralData", "reconstructible", "deterministic"]}
     }
     return doc
 
 
 def main():
-    ap = argparse.ArgumentParser(description="WAV -> WTGEN-1 JSON wavetable (RMS Hann pick + YIN CMND + multi-region)")
-    ap.add_argument("input_wav", type=str, help="Input .wav path")
+    ap = argparse.ArgumentParser(
+        description="WAV -> WTGEN-1 JSON (Ruta 1: spectralData harm+noise cuantizado; reconstruible sin WAV)"
+    )
+    ap.add_argument("input_wav", type=str, help="Input .wav path (solo para análisis/export)")
     ap.add_argument("-o", "--output", type=str, default="", help="Output .json path")
+
     ap.add_argument("--frames", type=int, default=DEFAULT_FRAMES)
     ap.add_argument("--tableSize", type=int, default=DEFAULT_TABLE_SIZE)
     ap.add_argument("--sr", type=int, default=DEFAULT_SR)
+
+    # seed del preset (para modulaciones futuras en el plugin)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--name", type=str, default="FromWavPeak")
+
+    ap.add_argument("--name", type=str, default="FromWavPeak_SpectralData")
     ap.add_argument("--engineName", type=str, default="wt_exe")
-    ap.add_argument("--engineVersion", type=str, default="1.0.0")
+    ap.add_argument("--engineVersion", type=str, default="1.2.0")
+
+    # controles de payload (puedes fijarlos y quitar flags si quieres “cero opciones”)
+    ap.add_argument("--harmonics", type=int, default=DEFAULT_HARMONICS)
+    ap.add_argument("--noiseBands", type=int, default=DEFAULT_NOISE_BANDS)
+
     args = ap.parse_args()
 
     in_path = Path(args.input_wav).expanduser().resolve()
@@ -607,14 +794,14 @@ def main():
 
     out_path = Path(args.output).expanduser().resolve() if args.output else in_path.with_suffix(".wtgen.json")
 
-    frames, meta = wav_to_wavetable_frames(
+    frames, meta = wav_to_frames_and_meta(
         wav_path=in_path,
         sr_target=int(args.sr),
         frames_n=int(args.frames),
         table_size=int(args.tableSize)
     )
 
-    doc = build_wtgen_json(
+    doc = build_wtgen_json_spectral(
         frames=frames,
         meta=meta,
         engine_name=args.engineName,
@@ -622,7 +809,9 @@ def main():
         preset_name=args.name,
         seed=args.seed,
         table_size=int(args.tableSize),
-        frames_n=int(args.frames)
+        frames_n=int(args.frames),
+        harm_count=int(args.harmonics),
+        noise_bands=int(args.noiseBands)
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,6 +825,11 @@ def main():
         f"f0~{meta.f0_hz:.2f}Hz  "
         f"period~{meta.period_samples:.2f} samples  "
         f"cmndMin={meta.cmnd_min:.3f}"
+    )
+    print(
+        f"     spectralData: harmonics={min(int(args.harmonics), (int(args.tableSize)//2)-1)} "
+        f"noiseBands={int(args.noiseBands)} phaseMode={PHASE_MODE} "
+        f"quant=({HARM_QUANT}, {NOISE_DB_QUANT})"
     )
 
 
