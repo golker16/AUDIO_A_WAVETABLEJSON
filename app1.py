@@ -43,6 +43,9 @@ PICK_WINDOW_MS = 50
 PICK_HOP_MS = 10
 PICK_SPAN_MS = 1500
 
+# --- NEW: Evitar transitorios al inicio (C) ---
+PICK_MIN_CENTER_MS = 200  # evita ataques/transitorios al inicio
+
 # f0 range para ciclo
 F0_MIN_HZ = 40.0
 F0_MAX_HZ = 2000.0
@@ -357,11 +360,19 @@ def find_peak_rms_candidates(x: np.ndarray, sr: int,
     hop = max(1, int(round(sr * hop_ms / 1000.0)))
     win = hann_window(win_len)
 
+    # --- NEW: offset de inicio para evitar picks en transitorios (C) ---
+    min_center = int(round(sr * (PICK_MIN_CENTER_MS / 1000.0)))
+    start0 = 0
+
+    # Queremos que el CENTRO de la ventana sea >= min_center
+    if len(x) > win_len and min_center < len(x):
+        start0 = clamp_int(min_center - (win_len // 2), 0, max(0, len(x) - win_len))
+
     centers = []
     rms_vals = []
     crest_vals = []
 
-    for start in range(0, max(1, len(x) - win_len), hop):
+    for start in range(start0, max(1, len(x) - win_len), hop):
         seg = x[start:start + win_len]
         if len(seg) < win_len:
             break
@@ -403,8 +414,11 @@ def find_peak_rms_candidates(x: np.ndarray, sr: int,
 
 
 def region_score(mono: np.ndarray, sr: int, center_idx: int) -> tuple[float, dict]:
+    # --- NEW: clamp real del span (B.1) ---
     span = int(round(sr * (PICK_SPAN_MS / 1000.0)))
+    span = max(1, min(span, len(mono)))  # clamp al tamaño real
     half = span // 2
+
     lo = clamp_int(center_idx - half, 0, len(mono) - 1)
     hi = clamp_int(center_idx + half, 0, len(mono) - 1)
     seg = mono[lo:hi].astype(np.float32)
@@ -727,6 +741,9 @@ def build_wtgen_json_spectral(frames: np.ndarray,
 
     macros = {"complexity": 0.5, "brightness": 0.5, "motion": 0.0}
 
+    # --- NEW: spanMs efectivo (B.2) ---
+    span_ms_effective = int(min(PICK_SPAN_MS, round(meta.duration_s * 1000.0)))
+
     doc = {
         "schema": "wtgen-1",
         "engine": {
@@ -757,7 +774,7 @@ def build_wtgen_json_spectral(frames: np.ndarray,
                 "metric": "rms_hann",
                 "windowMs": PICK_WINDOW_MS,
                 "hopMs": PICK_HOP_MS,
-                "spanMs": PICK_SPAN_MS,
+                "spanMs": span_ms_effective,  # NEW: metadata honesta
                 "crestMax": CREST_MAX,
                 "topK": TOPK_CANDIDATES,
                 "pickedTimeSec": meta.picked_time_s,
@@ -810,12 +827,12 @@ def build_wtgen_json_spectral(frames: np.ndarray,
 
         "morph": {"frameInterp": "cubic", "phasePolicy": "unwrap_lock"},
 
+        # --- NEW: quitar dcRemove/normalize del post (A) ---
         "post": {
-            "dcRemove": True,
-            "normalize": {"mode": "peak", "target": 0.999, "scope": "global"},
             "loopPolish": {"mode": "minclick", "strength": 0.5}
         },
 
         "meta": {"name": preset_name, "tags": ["spectralData", "reconstructible", "deterministic"]}
     }
     return doc
+
